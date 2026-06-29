@@ -3,6 +3,7 @@ import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 import requests
 from flask import Flask, abort, jsonify, render_template, request
@@ -25,6 +26,14 @@ GEO = Namespace("http://www.opengis.net/ont/geosparql#")
 L0 = Namespace("https://w3id.org/italia/onto/l0/")
 SM = Namespace("https://w3id.org/italia/onto/SM/")
 AC = Namespace("https://w3id.org/italia/onto/AccessCondition/")
+
+# Vocabolari esterni usati dall'arricchimento via web (DESCRIBE su DBpedia).
+SCHEMA = Namespace("http://schema.org/")
+DBO = Namespace("http://dbpedia.org/ontology/")
+DBP = Namespace("http://dbpedia.org/property/")
+DBR = Namespace("http://dbpedia.org/resource/")
+FOAF = Namespace("http://xmlns.com/foaf/0.1/")
+DCT = Namespace("http://purl.org/dc/terms/")
 
 INSTITUTE_BASE = "https://linkedopendata.comune.fi.it/data/cultural-institute/"
 # Namespace dei dati per i monumenti aggiunti dal form "Aggiungi Monumento":
@@ -50,6 +59,7 @@ PREFIX sm: <https://w3id.org/italia/onto/SM/>
 PREFIX ac: <https://w3id.org/italia/onto/AccessCondition/>
 PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
 PREFIX owl: <http://www.w3.org/2002/07/owl#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
 """
 
 app = Flask(__name__)
@@ -165,6 +175,7 @@ def index():
 
 @app.route("/api/monuments")
 def list_monuments():
+    # QUERY: elenco-monumenti
     query = PREFIXES + """
     SELECT ?inst ?name WHERE {
         ?inst a cis:CulturalInstituteOrSite ;
@@ -186,6 +197,7 @@ def accessibility_stats():
     monumenti senza condizione dichiarata, che COALESCE etichetta come
     'Nessuna informazione' (assenza != falsità, Open World Assumption).
     """
+    # QUERY: statistiche-accessibilita
     query = PREFIXES + """
     SELECT ?stato (COUNT(DISTINCT ?inst) AS ?numero) WHERE {
         ?inst a cis:CulturalInstituteOrSite .
@@ -207,6 +219,7 @@ def monument_detail(inst_id):
     require_valid_id(inst_id)
     inst_uri = resolve_institute_uri(inst_id)
 
+    # QUERY: dettaglio-monumento
     detail_query = PREFIXES + f"""
     SELECT ?name ?description ?accessibilityNote ?fullAddress ?wkt ?accessLabel ?accessDesc WHERE {{
         BIND(<{inst_uri}> AS ?inst)
@@ -233,6 +246,7 @@ def monument_detail(inst_id):
         if match:
             lon, lat = float(match.group(1)), float(match.group(2))
 
+    # QUERY: contatti-monumento
     contacts_query = PREFIXES + f"""
     SELECT DISTINCT ?c ?type ?value WHERE {{
         BIND(<{inst_uri}> AS ?inst)
@@ -298,6 +312,7 @@ def monument_nearby(inst_id):
     require_valid_id(inst_id)
     inst_uri = resolve_institute_uri(inst_id)
 
+    # QUERY: monumenti-vicini
     coords_query = PREFIXES + """
     SELECT ?inst ?name ?wkt WHERE {
         ?inst a cis:CulturalInstituteOrSite ;
@@ -341,6 +356,7 @@ def monument_photos(inst_id):
     require_valid_id(inst_id)
     inst_uri = resolve_institute_uri(inst_id)
 
+    # QUERY: nome-monumento-foto
     name_query = PREFIXES + f"""
     SELECT ?name WHERE {{
         BIND(<{inst_uri}> AS ?inst)
@@ -556,6 +572,7 @@ def resolve_class_targets(term):
 
 @app.route("/api/graph")
 def ontology_graph():
+    # QUERY: ontologia-classi
     classes_query = PREFIXES + """
     SELECT ?cls ?label WHERE {
         ?cls a owl:Class .
@@ -563,12 +580,14 @@ def ontology_graph():
         FILTER(isIRI(?cls))
     }
     """
+    # QUERY: ontologia-sottoclassi
     subclass_query = PREFIXES + """
     SELECT ?sub ?super WHERE {
         ?sub rdfs:subClassOf ?super .
         FILTER(isIRI(?super))
     }
     """
+    # QUERY: ontologia-proprieta
     props_query = PREFIXES + """
     SELECT ?prop ?label ?domain ?range ?inverse WHERE {
         ?prop a owl:ObjectProperty .
@@ -667,6 +686,7 @@ ACCESS_CONDITION_LABELS = {
 #    a mano in Python.
 # ?inst e ?accessKeyword arrivano via initBindings come termini RDF già
 # tipizzati (niente interpolazione di stringhe -> niente SPARQL injection).
+# QUERY: assegna-accessibilita
 SET_ACCESS_CONSTRUCT = PREFIXES + """
 CONSTRUCT {
     ?inst ac:hasAccessCondition ?access .
@@ -695,6 +715,7 @@ def list_monuments_missing_access():
     cercare di proposito l'assenza della tripla ac:hasAccessCondition: è il
     risvolto pratico dell'Open World Assumption (l'assenza va interrogata
     esplicitamente, non è un "falso" implicito)."""
+    # QUERY: monumenti-senza-accessibilita
     query = PREFIXES + """
     SELECT ?inst ?name WHERE {
         ?inst a cis:CulturalInstituteOrSite ;
@@ -747,6 +768,473 @@ def set_access_condition(inst_id):
     _save_additions()
 
     return jsonify({"id": inst_id, "accessCondition": ACCESS_CONDITION_LABELS[access_key]}), 200
+
+
+# ─────────────────────────────────────────────────────────────────────
+# CONSTRUCT — relazione di vicinanza tra monumenti (afi:vicinoA)
+# ─────────────────────────────────────────────────────────────────────
+# Materializza nel grafo una relazione che nei dati grezzi non esiste:
+# due monumenti sono "vicini" se la distanza tra le loro coordinate è sotto
+# una soglia. È una CONSTRUCT pura (nessun calcolo in Python): le coordinate
+# WKT "POINT (lon lat)" vengono scomposte con STRBEFORE/STRAFTER, convertite
+# in xsd:decimal e la distanza è approssimata col modello equirettangolare —
+# a Firenze (lat ~43.77°) 1° di longitudine ≈ 80.2 km e 1° di latitudine ≈
+# 111.0 km. Si confronta la distanza *al quadrato* con la soglia al quadrato
+# (?maxDist2) così da non servire sqrt, che SPARQL 1.1 puro non offre.
+# FILTER(STR(?a) < STR(?b)) tiene una sola coppia per ogni accoppiamento
+# (la relazione è simmetrica) ed esclude l'accoppiamento di un monumento con
+# se stesso.
+# QUERY: vicinanza-construct
+NEARBY_CONSTRUCT = PREFIXES + """
+CONSTRUCT {
+    ?a afi:vicinoA ?b .
+}
+WHERE {
+    ?a a cis:CulturalInstituteOrSite ;
+       afi:haCoordinate ?ga .
+    ?ga geo:asWKT ?wktA .
+    ?b a cis:CulturalInstituteOrSite ;
+       afi:haCoordinate ?gb .
+    ?gb geo:asWKT ?wktB .
+    FILTER(STR(?a) < STR(?b))
+
+    BIND(xsd:decimal(STRBEFORE(STRAFTER(STR(?wktA), "("), " ")) AS ?lonA)
+    BIND(xsd:decimal(STRBEFORE(STRAFTER(STRAFTER(STR(?wktA), "("), " "), ")")) AS ?latA)
+    BIND(xsd:decimal(STRBEFORE(STRAFTER(STR(?wktB), "("), " ")) AS ?lonB)
+    BIND(xsd:decimal(STRBEFORE(STRAFTER(STRAFTER(STR(?wktB), "("), " "), ")")) AS ?latB)
+
+    BIND((?lonA - ?lonB) * 80.2 AS ?dx)
+    BIND((?latA - ?latB) * 111.0 AS ?dy)
+    BIND(?dx * ?dx + ?dy * ?dy AS ?dist2)
+    FILTER(?dist2 < ?maxDist2)
+}
+"""
+
+
+@app.route("/api/nearby-construct")
+def nearby_construct():
+    """Esegue la CONSTRUCT di vicinanza e restituisce le triple generate.
+    `threshold` (km, default 0.3) è la distanza massima entro cui due monumenti
+    sono considerati vicini. Si restituiscono sia le coppie (con nome, per la
+    lista cliccabile) sia il grafo risultante serializzato in Turtle, per
+    mostrare il dato RDF effettivamente prodotto.
+    """
+    try:
+        threshold = float(request.args.get("threshold", "0.3"))
+    except ValueError:
+        return jsonify({"error": "Soglia non valida."}), 400
+    if not (0 < threshold <= 5):
+        return jsonify({"error": "La soglia deve essere tra 0 e 5 km."}), 400
+
+    constructed = graph.query(
+        NEARBY_CONSTRUCT, initBindings={"maxDist2": Literal(threshold * threshold)}
+    ).graph
+    constructed.bind("afi", AFI)
+
+    def name_of(uri):
+        name = graph.value(uri, L0.name)
+        return fix_mojibake(str(name)) if name else short_id(str(uri))
+
+    pairs = [
+        {
+            "a": {"id": short_id(str(s)), "name": name_of(s)},
+            "b": {"id": short_id(str(o)), "name": name_of(o)},
+        }
+        for s, _, o in constructed
+    ]
+    pairs.sort(key=lambda p: (p["a"]["name"], p["b"]["name"]))
+
+    return jsonify({
+        "threshold": threshold,
+        "count": len(pairs),
+        "pairs": pairs,
+        "turtle": constructed.serialize(format="turtle"),
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────
+# ASK — completezza di una proprietà su tutti i monumenti
+# ─────────────────────────────────────────────────────────────────────
+# Whitelist proprietà -> (IRI, descrizione leggibile). La proprietà da
+# verificare arriva come termine RDF via initBindings (?prop): nessuna
+# interpolazione di stringa nella query.
+COMPLETENESS_PROPERTIES = {
+    "coordinate": (AFI.haCoordinate, "le coordinate geografiche"),
+    "indirizzo": (AFI.hasAddress, "un indirizzo"),
+    "descrizione": (ARCO.description, "una descrizione"),
+    "accessibilita": (AC.hasAccessCondition, "una condizione di accesso"),
+    "contatti": (AFI.haContatti, "almeno un contatto"),
+}
+
+# ASK booleana: "esiste un monumento PRIVO della proprietà ?prop?".
+# FILTER NOT EXISTS interroga di proposito l'assenza della tripla (Open World
+# Assumption: l'assenza va cercata esplicitamente, non è un "falso" implicito).
+# Se la ASK è true il dataset è incompleto per quella proprietà; se è false
+# tutti i monumenti la possiedono.
+# QUERY: completezza-ask
+COMPLETENESS_ASK = PREFIXES + """
+ASK {
+    ?inst a cis:CulturalInstituteOrSite .
+    FILTER NOT EXISTS { ?inst ?prop ?value }
+}
+"""
+
+
+@app.route("/api/ask-completeness")
+def ask_completeness():
+    """Risponde con un booleano (query ASK) alla domanda «esiste almeno un
+    monumento privo della proprietà scelta?». `property` è una delle chiavi in
+    COMPLETENESS_PROPERTIES."""
+    prop_key = request.args.get("property", "")
+    if prop_key not in COMPLETENESS_PROPERTIES:
+        return jsonify({"error": "Proprietà non valida."}), 400
+
+    prop_uri, prop_desc = COMPLETENESS_PROPERTIES[prop_key]
+    exists_missing = bool(
+        graph.query(COMPLETENESS_ASK, initBindings={"prop": prop_uri}).askAnswer
+    )
+
+    return jsonify({
+        "property": prop_key,
+        "description": prop_desc,
+        # risposta grezza della ASK: True = esiste un monumento senza la proprietà
+        "existsMissing": exists_missing,
+        # interpretazione: il dataset è completo se NON esiste alcun mancante
+        "complete": not exists_missing,
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────
+# DESCRIBE — arricchimento via web (Linked Data) con DBpedia + schema.org
+# ─────────────────────────────────────────────────────────────────────
+# Idea: partendo da una risorsa della NOSTRA base di conoscenza (es. la
+# Biblioteca Medicea Laurenziana), si va sul web a recuperare le risorse ad
+# essa collegate e si costruisce un NUOVO grafo. Lo si fa eseguendo una vera
+# query DESCRIBE su un endpoint SPARQL pubblico — DBpedia — che descrive le
+# risorse anche con il vocabolario schema.org. schema.org è la chiave per
+# trovare "altre risorse": tipizza l'entità (schema:Library, schema:Organization)
+# e, con schema:sameAs/owl:sameAs, la collega ad altre risorse del web
+# (Wikidata, VIAF, le altre DBpedia di lingua…).
+DBPEDIA_SPARQL = "https://dbpedia.org/sparql"
+DBPEDIA_HEADERS = {
+    "User-Agent": "ArchitettureFirenzeWebApp/1.0 (educational project; contact: example@example.com)"
+}
+ABSTRACT_LIMIT = 400
+
+# Predicati della DESCRIBE remota da includere nel nuovo grafo: (gruppo, tetto
+# massimo di oggetti, qname per l'etichetta dell'arco). Il tetto evita di
+# trascinare le decine di wikiPageWikiLink: il grafo deve restare leggibile.
+# rdf:type è incluso a parte, solo per i tipi schema.org.
+# Si includono solo risorse che parlano DEL monumento (pagina Wikipedia, sito
+# ufficiale, immagini, categorie): NON i sameAs verso altre knowledge base
+# (Wikidata, VIAF, GND, Freebase…), che porterebbero fuori dall'input di partenza.
+RELATED_PREDICATES = {
+    FOAF.isPrimaryTopicOf: ("wikipedia", 2, "foaf:isPrimaryTopicOf"),
+    FOAF.homepage: ("website", 2, "foaf:homepage"),
+    DBP.website: ("website", 2, "dbp:website"),
+    FOAF.depiction: ("image", 3, "foaf:depiction"),
+    DBO.thumbnail: ("image", 1, "dbo:thumbnail"),
+    DCT.subject: ("category", 6, "dct:subject"),
+}
+
+# gruppo di risorsa collegata -> "kind" del nodo (per il colore nel grafo)
+RELATED_GROUP_KIND = {
+    "wikipedia": "Wikipedia",
+    "website": "Website",
+    "image": "Image",
+    "category": "Category",
+}
+
+
+DBPEDIA_LOOKUP = "https://lookup.dbpedia.org/api/search"
+
+# Parole troppo comuni per identificare il monumento giusto in una ricerca
+# fuzzy: articoli/preposizioni e nomi generici di tipologia. Vengono escluse
+# dai "token distintivi" usati per validare i candidati del lookup.
+_NAME_STOPWORDS = {"di", "del", "dei", "della", "delle", "degli", "il", "lo",
+                   "la", "le", "i", "gli", "e", "a", "al", "alla", "o", "da",
+                   "in", "con", "san", "santa", "santo", "santi", "ss"}
+_NAME_GENERIC = {"palazzo", "piazza", "piazzale", "via", "viale", "ponte",
+                 "chiesa", "cimitero", "forte", "museo", "loggia", "monumento",
+                 "monumentale", "murale", "lapide", "casa", "baluardo",
+                 "complesso", "giardino", "torre", "porta", "villa", "stadio",
+                 "stazione", "tabernacolo"}
+
+
+def _dbpedia_get(sparql, accept):
+    return requests.get(
+        DBPEDIA_SPARQL,
+        params={"query": sparql, "format": accept},
+        headers=DBPEDIA_HEADERS,
+        timeout=20,
+    )
+
+
+def _name_tokens(text):
+    return [t for t in re.split(r"[^0-9a-zà-ÿ]+", text.lower()) if t]
+
+
+def _distinctive_tokens(text):
+    """Token "forti" del nome (lunghi, non generici): identificano il monumento."""
+    return {t for t in _name_tokens(text)
+            if len(t) >= 4 and t not in _NAME_STOPWORDS and t not in _NAME_GENERIC}
+
+
+def _clean_name(name):
+    """Toglie i suffissi esplicativi (dopo ' - ' o ':') e le virgolette, che
+    confondono la ricerca fuzzy (es. 'Palazzo Vecchio - Quartieri Monumentali'
+    -> 'Palazzo Vecchio')."""
+    base = re.split(r"\s[-–]\s|:", name)[0]
+    return base.replace('"', "").replace("“", "").replace("”", "").strip()
+
+
+def _exact_label_candidates(name):
+    """Candidati per match esatto di rdfs:label (italiano, poi inglese), limitati
+    al dominio dbpedia.org."""
+    esc = name.replace("\\", "\\\\").replace('"', '\\"')
+    uris = []
+    for lang in ("it", "en"):
+        query = ('SELECT ?s WHERE { ?s rdfs:label "%s"@%s . '
+                 'FILTER(STRSTARTS(STR(?s), "http://dbpedia.org/resource/")) } LIMIT 1'
+                 % (esc, lang))
+        try:
+            resp = _dbpedia_get(query, "application/sparql-results+json")
+            resp.raise_for_status()
+            bindings = resp.json().get("results", {}).get("bindings", [])
+            if bindings:
+                uris.append(bindings[0]["s"]["value"])
+        except (requests.RequestException, ValueError, KeyError):
+            continue
+    return uris
+
+
+def _dbpedia_lookup(query, max_results=3):
+    """Ricerca fuzzy con l'API DBpedia Lookup; restituisce gli IRI candidati."""
+    try:
+        resp = requests.get(
+            DBPEDIA_LOOKUP,
+            params={"query": query, "maxResults": max_results, "format": "json"},
+            headers={**DBPEDIA_HEADERS, "Accept": "application/json"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        uris = []
+        for doc in resp.json().get("docs", []):
+            res = doc.get("resource")
+            if isinstance(res, list):
+                res = res[0] if res else None
+            if res:
+                uris.append(res)
+        return uris
+    except (requests.RequestException, ValueError):
+        return []
+
+
+def _is_florence_related(resource_uri):
+    """Verifica con una ASK remota che la risorsa sia davvero collegata a Firenze
+    (link a dbr:Florence, oppure 'Florence'/'Firenze' nei suoi letterali o negli
+    IRI collegati, es. le categorie). È il filtro che scarta gli omonimi non
+    fiorentini (la Piazza San Marco di Venezia, l'Aston Villa, …)."""
+    query = ('ASK { <%s> ?p ?o . FILTER( '
+             '?o IN (<http://dbpedia.org/resource/Florence>, '
+             '<http://dbpedia.org/resource/Metropolitan_City_of_Florence>, '
+             '<http://dbpedia.org/resource/Province_of_Florence>) '
+             '|| (isLiteral(?o) && (CONTAINS(STR(?o), "Florence") || CONTAINS(STR(?o), "Firenze"))) '
+             '|| (isIRI(?o) && CONTAINS(STR(?o), "Florence")) ) }' % resource_uri)
+    try:
+        resp = _dbpedia_get(query, "application/sparql-results+json")
+        resp.raise_for_status()
+        return bool(resp.json().get("boolean"))
+    except (requests.RequestException, ValueError):
+        return False
+
+
+def find_dbpedia_resource(name):
+    """Risolve un monumento qualsiasi alla sua risorsa DBpedia *fiorentina*.
+    Raccoglie i candidati — match esatto per label (it/en) e, in fallback,
+    DBpedia Lookup fuzzy sul nome ripulito — e restituisce il primo che risulta
+    collegato a Firenze (verifica con _is_florence_related). I candidati fuzzy
+    devono inoltre condividere un token distintivo col nome, per escludere match
+    assurdi (es. 'Villa Favard' -> 'Aston Villa'). Restituisce l'IRI o None."""
+    seen = set()
+
+    # 1) match esatto (alta precisione) — ma va comunque verificato per le
+    #    omonimie con altre città.
+    for uri in _exact_label_candidates(name):
+        if uri not in seen:
+            seen.add(uri)
+            if _is_florence_related(uri):
+                return uri
+
+    # 2) fallback fuzzy: lookup sul nome ripulito, filtro per token distintivo,
+    #    poi verifica Firenze.
+    cleaned = _clean_name(name)
+    distinctive = _distinctive_tokens(cleaned)
+    for uri in _dbpedia_lookup(cleaned):
+        if uri in seen:
+            continue
+        seen.add(uri)
+        cand_tokens = set(_name_tokens(unquote(uri.rsplit("/", 1)[-1])))
+        if distinctive and not (distinctive & cand_tokens):
+            continue
+        if _is_florence_related(uri):
+            return uri
+
+    return None
+
+
+def fetch_dbpedia_describe(resource_uri):
+    """Esegue DESCRIBE <resource> sull'endpoint DBpedia e ritorna il grafo RDF
+    risultante (o None in caso di errore di rete/parsing)."""
+    try:
+        resp = _dbpedia_get(f"DESCRIBE <{resource_uri}>", "text/turtle")
+        resp.raise_for_status()
+        external = Graph()
+        external.parse(data=resp.text, format="turtle")
+        return external
+    except (requests.RequestException, Exception):  # parsing incluso
+        return None
+
+
+def readable_label(uri):
+    """Etichetta leggibile per una risorsa esterna: ultimo segmento dell'IRI,
+    de-quotato e con gli underscore trasformati in spazi (es.
+    .../resource/Laurentian_Library -> 'Laurentian Library')."""
+    tail = uri.rstrip("/").rsplit("/", 1)[-1].rsplit("#", 1)[-1]
+    return unquote(tail).replace("_", " ") or uri
+
+
+# Host del tipo "xx.dbpedia.org" / "xx.wikipedia.org": edizioni in lingua.
+_LANG_EDITION_HOST = re.compile(r"^([a-z]{2})\.(dbpedia\.org|wikipedia\.org)$")
+
+
+def _is_allowed_language_resource(uri):
+    """True se la risorsa NON è un'edizione in una lingua diversa da italiano o
+    inglese. Scarta le DBpedia/Wikipedia di altre lingue (es. de.dbpedia.org,
+    zh.wikipedia.org) ma tiene quelle it/en, la DBpedia inglese canonica
+    (dbpedia.org, senza prefisso di lingua) e le fonti non legate a una lingua
+    (Wikidata, VIAF, GND…)."""
+    host = urlparse(uri).netloc.lower()
+    match = _LANG_EDITION_HOST.match(host)
+    if match:
+        return match.group(1) in ("it", "en")
+    return True
+
+
+@app.route("/api/monuments/<inst_id>/describe")
+def monument_describe(inst_id):
+    """Arricchimento via web: trova su DBpedia la risorsa corrispondente al
+    monumento, esegue lì una query DESCRIBE e costruisce un nuovo grafo con le
+    risorse collegate al concetto di partenza, sfruttando schema.org per la
+    classificazione e i collegamenti. Restituisce il grafo in Turtle più una
+    vista strutturata (tipi schema.org + risorse collegate per categoria)."""
+    require_valid_id(inst_id)
+    inst_uri = URIRef(resolve_institute_uri(inst_id))
+
+    name = graph.value(inst_uri, L0.name)
+    name = fix_mojibake(str(name)) if name else short_id(str(inst_uri))
+
+    resource = find_dbpedia_resource(name)
+    if resource is None:
+        return jsonify({"id": inst_id, "name": name, "found": False})
+
+    external = fetch_dbpedia_describe(resource)
+    if external is None:
+        return jsonify({"id": inst_id, "name": name, "found": False,
+                        "error": "Risorsa trovata ma DESCRIBE remota non riuscita."})
+
+    res_ref = URIRef(resource)
+
+    # ── Costruzione del NUOVO grafo ──────────────────────────────────
+    result = Graph()
+    for pfx, ns in [("afi", AFI), ("schema", SCHEMA), ("dbo", DBO), ("dbp", DBP),
+                    ("dbr", DBR), ("foaf", FOAF), ("dct", DCT),
+                    ("rdfs", RDFS), ("rdf", RDF), ("owl", OWL)]:
+        # replace=True: forza il prefisso anche se rdflib ne ha già uno di default
+        # (es. "schema" -> https://schema.org/), così il Turtle resta leggibile.
+        result.bind(pfx, ns, replace=True)
+
+    # 1) il ponte: la nostra risorsa è la stessa cosa di quella su DBpedia.
+    result.add((inst_uri, OWL.sameAs, res_ref))
+
+    # In parallelo al grafo RDF si costruisce la vista a nodi/archi (nodes/edges)
+    # che il frontend disegna con sigma/graphology, come "Grafico dell'ontologia".
+    nodes = {}
+    edges = []
+
+    def ensure_node(node_id, label, kind):
+        if node_id not in nodes:
+            nodes[node_id] = {"id": node_id, "label": short_label(label), "kind": kind}
+
+    # nodo centrale = il nostro monumento; ad esso si lega la risorsa DBpedia.
+    ensure_node(str(inst_uri), name, "Monument")
+    ensure_node(resource, readable_label(resource), "DBpedia")
+    edges.append({"from": str(inst_uri), "to": resource, "label": "owl:sameAs"})
+
+    # 2) classificazione schema.org dell'entità (i "tipi" che la qualificano).
+    schema_types = []
+    for o in external.objects(res_ref, RDF.type):
+        if str(o).startswith(str(SCHEMA)):
+            result.add((res_ref, RDF.type, o))
+            qname = str(o).replace(str(SCHEMA), "schema:")
+            schema_types.append(qname)
+            ensure_node(str(o), qname, "SchemaType")
+            edges.append({"from": resource, "to": str(o), "label": "rdf:type"})
+
+    # 3) etichetta e abstract (it/en) per contesto, abstract troncato.
+    for lang in ("it", "en"):
+        for o in external.objects(res_ref, RDFS.label):
+            if isinstance(o, Literal) and o.language == lang:
+                result.add((res_ref, RDFS.label, o))
+                break
+    for lang in ("it", "en"):
+        for o in external.objects(res_ref, DBO.abstract):
+            if isinstance(o, Literal) and o.language == lang:
+                text = str(o)
+                if len(text) > ABSTRACT_LIMIT:
+                    text = text[:ABSTRACT_LIMIT].rstrip() + "…"
+                result.add((res_ref, DBO.abstract, Literal(text, lang=lang)))
+                break
+
+    # 4) risorse collegate, raggruppate per categoria e con tetto per predicato.
+    related = {"wikipedia": [], "website": [], "image": [], "category": []}
+    seen = set()
+    for pred, (group, cap, pqname) in RELATED_PREDICATES.items():
+        count = 0
+        for o in external.objects(res_ref, pred):
+            if not isinstance(o, URIRef) or count >= cap:
+                continue
+            # solo fonti in italiano/inglese (o non legate a una lingua):
+            # niente DBpedia/Wikipedia di altre lingue.
+            if not _is_allowed_language_resource(str(o)):
+                continue
+            key = (group, str(o))
+            if key in seen:
+                continue
+            seen.add(key)
+            result.add((res_ref, pred, o))
+            label = readable_label(str(o))
+            related[group].append({
+                "uri": str(o),
+                "label": label,
+                "source": urlparse(str(o)).netloc,
+            })
+            ensure_node(str(o), label, RELATED_GROUP_KIND[group])
+            edges.append({"from": resource, "to": str(o), "label": pqname})
+            count += 1
+
+    return jsonify({
+        "id": inst_id,
+        "name": name,
+        "found": True,
+        "resource": resource,
+        "resourceLabel": readable_label(resource),
+        "schemaTypes": schema_types,
+        "related": related,
+        "tripleCount": len(result),
+        "turtle": result.serialize(format="turtle"),
+        "graph": {"nodes": list(nodes.values()), "edges": edges},
+    })
 
 
 if __name__ == "__main__":

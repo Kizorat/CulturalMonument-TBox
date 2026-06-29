@@ -1,4 +1,5 @@
-const select = document.getElementById("monument-select");
+const monumentInput = document.getElementById("monument-input");
+const monumentSuggestions = document.getElementById("monument-suggestions");
 const panel = document.getElementById("monument-panel");
 const lightbox = document.getElementById("lightbox");
 const lightboxImg = document.getElementById("lightbox-img");
@@ -6,19 +7,116 @@ const lightboxClose = document.getElementById("lightbox-close");
 const galleryDetails = document.getElementById("gallery-details");
 const graphDetails = document.getElementById("graph-details");
 
+// ── Search bar riutilizzabile con autocomplete ──────────────────────
+// Usata sia da "Seleziona Monumento" sia da "Ulteriori informazioni":
+// filtra gli elementi {id, name} il cui nome contiene il testo digitato,
+// evidenzia la porzione che combacia e mostra i suggerimenti allineati sotto
+// l'input. onSelect(item) scatta alla scelta (click, Invio o selezione
+// programmatica via selectById).
+function escapeHtml(text) {
+  const div = document.createElement("div");
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+function createSearchBar({ input, suggestionsEl, getItems, onSelect, emptyText = "Nessun risultato." }) {
+  let activeIndex = -1;
+
+  function hide() {
+    suggestionsEl.classList.add("hidden");
+    suggestionsEl.innerHTML = "";
+    activeIndex = -1;
+    input.setAttribute("aria-expanded", "false");
+  }
+
+  function render() {
+    const query = input.value.trim().toLowerCase();
+    if (!query) { hide(); return; }
+    const matches = getItems()
+      .filter((it) => it.name.toLowerCase().includes(query))
+      .slice(0, 8);
+
+    suggestionsEl.innerHTML = "";
+    activeIndex = -1;
+    if (matches.length === 0) {
+      suggestionsEl.innerHTML = `<li class="suggestions-empty">${emptyText}</li>`;
+    } else {
+      for (const it of matches) {
+        const idx = it.name.toLowerCase().indexOf(query);
+        const li = document.createElement("li");
+        li.setAttribute("role", "option");
+        li.dataset.id = it.id;
+        li.innerHTML = escapeHtml(it.name.slice(0, idx)) +
+          '<span class="match">' + escapeHtml(it.name.slice(idx, idx + query.length)) + "</span>" +
+          escapeHtml(it.name.slice(idx + query.length));
+        // mousedown (non click): scatta prima del blur dell'input
+        li.addEventListener("mousedown", (e) => { e.preventDefault(); choose(it); });
+        suggestionsEl.appendChild(li);
+      }
+    }
+    suggestionsEl.classList.remove("hidden");
+    input.setAttribute("aria-expanded", "true");
+  }
+
+  function setActive(items) {
+    items.forEach((li, i) => li.classList.toggle("active", i === activeIndex));
+    if (activeIndex >= 0) items[activeIndex].scrollIntoView({ block: "nearest" });
+  }
+
+  function choose(item) {
+    input.value = item.name;
+    hide();
+    onSelect(item);
+  }
+
+  input.addEventListener("input", render);
+  input.addEventListener("focus", () => { if (input.value.trim()) render(); });
+  input.addEventListener("keydown", (e) => {
+    const items = [...suggestionsEl.querySelectorAll("li[role='option']")];
+    if (e.key === "ArrowDown" && items.length) {
+      e.preventDefault();
+      activeIndex = (activeIndex + 1) % items.length;
+      setActive(items);
+    } else if (e.key === "ArrowUp" && items.length) {
+      e.preventDefault();
+      activeIndex = (activeIndex - 1 + items.length) % items.length;
+      setActive(items);
+    } else if (e.key === "Enter") {
+      if (activeIndex >= 0 && items[activeIndex]) {
+        e.preventDefault();
+        const it = getItems().find((x) => String(x.id) === items[activeIndex].dataset.id);
+        if (it) choose(it);
+      }
+    } else if (e.key === "Escape") {
+      hide();
+    }
+  });
+  // ritardo: lascia completare l'eventuale mousedown su un suggerimento
+  input.addEventListener("blur", () => setTimeout(hide, 120));
+
+  return {
+    // selezione programmatica per id (link "vicini", apertura scheda, ecc.)
+    selectById(id) {
+      const it = getItems().find((x) => String(x.id) === String(id));
+      if (it) choose(it);
+    },
+  };
+}
+
+let monumentItems = []; // {id, name} dalla KB, per la search bar dei monumenti
+
 async function loadMonumentList() {
   const res = await fetch("/api/monuments");
-  const monuments = await res.json();
-  // rimuove tutte le opzioni tranne il placeholder iniziale, per poter
-  // richiamare questa funzione anche dopo un inserimento senza duplicarle
-  while (select.options.length > 1) select.remove(1);
-  for (const m of monuments) {
-    const opt = document.createElement("option");
-    opt.value = m.id;
-    opt.textContent = m.name;
-    select.appendChild(opt);
-  }
+  monumentItems = await res.json();
 }
+
+const monumentSearch = createSearchBar({
+  input: monumentInput,
+  suggestionsEl: monumentSuggestions,
+  getItems: () => monumentItems,
+  onSelect: (it) => onMonumentSelected(it.id),
+  emptyText: "Nessun monumento trovato.",
+});
 
 function renderContacts(contacts) {
   const container = document.getElementById("m-contacts");
@@ -140,9 +238,8 @@ async function renderNearby(monumentId) {
     link.textContent = m.name;
     link.addEventListener("click", (e) => {
       e.preventDefault();
-      // naviga alla scheda del monumento vicino riusando il select esistente
-      select.value = m.id;
-      select.dispatchEvent(new Event("change"));
+      // naviga alla scheda del monumento vicino riusando la search bar
+      monumentSearch.selectById(m.id);
       panel.scrollIntoView({ behavior: "smooth", block: "start" });
     });
 
@@ -213,7 +310,6 @@ graphDetails.addEventListener("toggle", () => {
   }
 });
 
-select.addEventListener("change", (e) => onMonumentSelected(e.target.value));
 
 // ── Grafo (sigma v3) ────────────────────────────────────────────────
 const EdgeArrowProgram = Sigma.rendering.EdgeArrowProgram;
@@ -232,6 +328,13 @@ const KIND_COLORS = {
   Email: "#ad1457",
   Telephone: "#00838f",
   Class: "#7a3b1d",
+  // arricchimento via web (sezione DESCRIBE)
+  DBpedia: "#1565c0",
+  SchemaType: "#c98a3a",
+  Wikipedia: "#37474f",
+  Website: "#2e7d32",
+  Image: "#ad1457",
+  Category: "#00838f",
 };
 
 // Assegna una curvatura agli archi paralleli (stessa coppia di nodi, in una
@@ -240,7 +343,7 @@ const KIND_COLORS = {
 function assignCurvatures(graph) {
   const groups = {};
   graph.forEachEdge((edge, _attr, source, target) => {
-    const key = source < target ? `${source} ${target}` : `${target} ${source}`;
+    const key = source < target ? `${source} ${target}` : `${target} ${source}`;
     (groups[key] = groups[key] || []).push(edge);
   });
   for (const key in groups) {
@@ -424,6 +527,8 @@ function renderGraphLegend(container, data) {
   const LABELS = {
     Monument: "Monumento", Address: "Indirizzo", Geometria: "Coordinate",
     AccessCondition: "Accessibilità", WebSite: "Sito web", Email: "Email", Telephone: "Telefono",
+    DBpedia: "Risorsa DBpedia", SchemaType: "Tipo schema.org",
+    Wikipedia: "Wikipedia", Website: "Sito ufficiale", Image: "Immagine", Category: "Categoria",
   };
   for (const kind of kinds) {
     const item = document.createElement("span");
@@ -495,6 +600,9 @@ const views = {
   graph: document.getElementById("view-graph"),
   stats: document.getElementById("view-stats"),
   access: document.getElementById("view-access"),
+  nearby: document.getElementById("view-nearby"),
+  completeness: document.getElementById("view-completeness"),
+  describe: document.getElementById("view-describe"),
 };
 
 function showView(name) {
@@ -525,6 +633,18 @@ function showView(name) {
   // apertura: si accorcia man mano che si assegnano le condizioni.
   if (name === "access") loadMissingAccessList();
 
+  // la tendina della sezione DESCRIBE riusa la stessa lista monumenti; la si
+  // popola alla prima apertura (riflette anche eventuali monumenti aggiunti).
+  if (name === "describe") {
+    loadDescribeList();
+    if (describeGraphState) {
+      describeGraphState.renderer.refresh();
+      describeGraphState.physics.run(2000);
+    }
+  } else {
+    describeGraphState?.physics.stop();
+  }
+
   if (name === "monuments" && monumentGraphState && graphDetails.open) {
     monumentGraphState.renderer.refresh();
     monumentGraphState.physics.run(2000);
@@ -538,36 +658,42 @@ tabButtons.forEach((btn) => btn.addEventListener("click", () => showView(btn.dat
 
 // ── Sezione "Modifica Accessibilità" ────────────────────────────────
 // Mostra i monumenti che NON hanno una condizione di accesso (query backend
-// con FILTER NOT EXISTS) in una casella di suggerimento (datalist), e
-// permette di assegnarne una: il backend esegue una SPARQL CONSTRUCT che
-// aggiunge al grafo la tripla mancante ac:hasAccessCondition.
+// con FILTER NOT EXISTS) in una search bar con autocomplete, e permette di
+// assegnarne una: il backend esegue una SPARQL CONSTRUCT che aggiunge al grafo
+// la tripla mancante ac:hasAccessCondition.
 const editAccessForm = document.getElementById("edit-access-form");
 const eaMonumentInput = document.getElementById("ea-monument");
-const eaMonumentList = document.getElementById("ea-monument-list");
+const eaMonumentSuggestions = document.getElementById("ea-monument-suggestions");
 const eaAccessSelect = document.getElementById("ea-access");
 const eaCount = document.getElementById("ea-count");
 const eaFeedback = document.getElementById("ea-feedback");
 
-// mappa nome visualizzato -> id, per risalire all'id dalla scelta nel datalist
+// {id, name} dei monumenti senza accesso (per la search) e mappa nome -> id
+// (per risolvere la scelta al submit).
+let missingAccessItems = [];
 let missingAccessByName = new Map();
 
 async function loadMissingAccessList() {
   const res = await fetch("/api/monuments/missing-access");
   const monuments = await res.json();
 
-  missingAccessByName = new Map();
-  eaMonumentList.innerHTML = "";
-  for (const m of monuments) {
-    missingAccessByName.set(m.name, m.id);
-    const opt = document.createElement("option");
-    opt.value = m.name;
-    eaMonumentList.appendChild(opt);
-  }
+  missingAccessItems = monuments;
+  missingAccessByName = new Map(monuments.map((m) => [m.name, m.id]));
 
   eaCount.textContent = monuments.length
     ? `${monuments.length} monumenti senza condizione di accesso.`
     : "Tutti i monumenti hanno già una condizione di accesso.";
 }
+
+// La scelta riempie solo l'input (l'azione vera è il submit del form, dopo aver
+// scelto anche la condizione di accesso): onSelect non deve fare altro.
+createSearchBar({
+  input: eaMonumentInput,
+  suggestionsEl: eaMonumentSuggestions,
+  getItems: () => missingAccessItems,
+  onSelect: () => {},
+  emptyText: "Nessun monumento senza condizione di accesso.",
+});
 
 editAccessForm.addEventListener("submit", async (e) => {
   e.preventDefault();
@@ -612,8 +738,7 @@ editAccessForm.addEventListener("submit", async (e) => {
 
     await loadMissingAccessList(); // il monumento appena modificato sparisce dai suggerimenti
     await loadMonumentList();
-    select.value = monumentId;
-    select.dispatchEvent(new Event("change"));
+    monumentSearch.selectById(monumentId);
     showView("monuments");
   } catch {
     eaFeedback.textContent = "Impossibile contattare il server. Riprova.";
@@ -622,6 +747,187 @@ editAccessForm.addEventListener("submit", async (e) => {
     submitBtn.disabled = false;
   }
 });
+
+// ── Sezione "Vicinanze" (query SPARQL CONSTRUCT) ────────────────────
+// Esegue la CONSTRUCT lato backend con la soglia scelta e mostra sia le coppie
+// di monumenti vicini (cliccabili) sia le triple afi:vicinoA generate in Turtle.
+const nearbyForm = document.getElementById("nearby-form");
+const nbThreshold = document.getElementById("nb-threshold");
+const nbSummary = document.getElementById("nb-summary");
+const nbPairs = document.getElementById("nb-pairs");
+const nbTurtle = document.getElementById("nb-turtle");
+
+function openMonument(monumentId) {
+  // riusa la search bar principale per aprire la scheda del monumento
+  monumentSearch.selectById(monumentId);
+  showView("monuments");
+  panel.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+nearbyForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const submitBtn = nearbyForm.querySelector(".btn-primary");
+  submitBtn.disabled = true;
+  nbSummary.textContent = "Esecuzione della query CONSTRUCT…";
+  nbPairs.innerHTML = "";
+  nbTurtle.textContent = "";
+
+  try {
+    const res = await fetch(`/api/nearby-construct?threshold=${encodeURIComponent(nbThreshold.value)}`);
+    const data = await res.json();
+    if (!res.ok) {
+      nbSummary.textContent = data.error || "Errore nell'esecuzione della query.";
+      return;
+    }
+
+    nbSummary.textContent = `${data.count} coppie di monumenti entro ${data.threshold} km.`;
+    nbTurtle.textContent = data.turtle.trim() || "# nessuna tripla generata";
+
+    if (data.pairs.length === 0) {
+      nbPairs.innerHTML = '<li class="contact-empty">Nessuna coppia entro questa soglia.</li>';
+      return;
+    }
+    for (const pair of data.pairs) {
+      const li = document.createElement("li");
+      const a = document.createElement("a");
+      a.href = "#"; a.className = "nearby-link"; a.textContent = pair.a.name;
+      a.addEventListener("click", (ev) => { ev.preventDefault(); openMonument(pair.a.id); });
+      const b = document.createElement("a");
+      b.href = "#"; b.className = "nearby-link"; b.textContent = pair.b.name;
+      b.addEventListener("click", (ev) => { ev.preventDefault(); openMonument(pair.b.id); });
+      const sep = document.createElement("span");
+      sep.className = "nearby-distance"; sep.textContent = "↔";
+      li.append(a, sep, b);
+      nbPairs.appendChild(li);
+    }
+  } catch {
+    nbSummary.textContent = "Impossibile contattare il server. Riprova.";
+  } finally {
+    submitBtn.disabled = false;
+  }
+});
+
+// ── Sezione "Completezza" (query SPARQL ASK) ────────────────────────
+// La ASK risponde true/false a "esiste un monumento privo della proprietà?".
+const completenessForm = document.getElementById("completeness-form");
+const cpProperty = document.getElementById("cp-property");
+const cpResult = document.getElementById("cp-result");
+
+completenessForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  cpResult.className = "ask-result hidden";
+
+  try {
+    const res = await fetch(`/api/ask-completeness?property=${encodeURIComponent(cpProperty.value)}`);
+    const data = await res.json();
+    if (!res.ok) {
+      cpResult.className = "ask-result error";
+      cpResult.textContent = data.error || "Errore nell'esecuzione della query.";
+      return;
+    }
+
+    // existsMissing = risposta grezza della ASK; complete = sua interpretazione
+    const askWord = data.existsMissing ? "VERO" : "FALSO";
+    const verdict = data.complete
+      ? `Tutti i monumenti hanno ${data.description}.`
+      : `Almeno un monumento è privo di ${data.description}.`;
+    cpResult.className = `ask-result ${data.complete ? "ok" : "warn"}`;
+    cpResult.innerHTML =
+      `<span class="ask-badge">ASK → ${askWord}</span>` +
+      `<p>Esiste un monumento privo di ${data.description}? <strong>${askWord}</strong>.</p>` +
+      `<p>${data.complete ? "✓" : "✗"} ${verdict}</p>`;
+  } catch {
+    cpResult.className = "ask-result error";
+    cpResult.textContent = "Impossibile contattare il server. Riprova.";
+  }
+});
+
+// ── Sezione "Scheda RDF" (query SPARQL DESCRIBE) ────────────────────
+const describeInput = document.getElementById("describe-input");
+const describeSuggestions = document.getElementById("describe-suggestions");
+const dscStatus = document.getElementById("dsc-status");
+const dscResult = document.getElementById("dsc-result");
+const dscResource = document.getElementById("dsc-resource");
+const dscTypes = document.getElementById("dsc-types");
+const dscTurtle = document.getElementById("dsc-turtle");
+let describeListLoaded = false;
+let describeGraphState = null;
+let describeItems = []; // {id, name} dalla KB, per la search bar di questa sezione
+let lastDescribeId = null;
+
+async function loadDescribeList() {
+  if (describeListLoaded) return;
+  const res = await fetch("/api/monuments");
+  describeItems = await res.json();
+  describeListLoaded = true;
+}
+
+createSearchBar({
+  input: describeInput,
+  suggestionsEl: describeSuggestions,
+  getItems: () => describeItems,
+  onSelect: (it) => runDescribe(it.id),
+  emptyText: "Nessun monumento trovato.",
+});
+
+async function runDescribe(id) {
+  if (!id || id === lastDescribeId) return; // niente o già mostrato
+  lastDescribeId = id;
+
+  dscResult.classList.add("hidden");
+  describeGraphState?.physics.stop();
+  dscStatus.textContent = "Ricerca su DBpedia ed esecuzione della DESCRIBE remota…";
+
+  let data;
+  try {
+    const res = await fetch(`/api/monuments/${id}/describe`);
+    data = await res.json();
+  } catch {
+    dscStatus.textContent = "Impossibile contattare il server. Riprova.";
+    return;
+  }
+
+  if (!data.found) {
+    dscStatus.textContent =
+      data.error ||
+      `Nessuna risorsa corrispondente trovata su DBpedia per "${data.name}".`;
+    return;
+  }
+
+  dscStatus.textContent = `${data.tripleCount} triple generate per "${data.name}".`;
+
+  dscResource.textContent = data.resourceLabel;
+  dscResource.href = data.resource;
+
+  // badge dei tipi schema.org
+  dscTypes.innerHTML = "";
+  for (const t of data.schemaTypes) {
+    const badge = document.createElement("span");
+    badge.className = "schema-badge";
+    badge.textContent = t;
+    dscTypes.appendChild(badge);
+  }
+  document.getElementById("dsc-types-wrap").classList.toggle("hidden", data.schemaTypes.length === 0);
+
+  dscTurtle.textContent = data.turtle.trim();
+  dscResult.classList.remove("hidden");
+
+  // grafo visuale delle risorse collegate (sigma/graphology), come l'ontologia
+  renderDescribeGraph(data.graph);
+}
+
+function renderDescribeGraph(graphData) {
+  const container = document.getElementById("dsc-graph");
+  if (describeGraphState) {
+    describeGraphState.physics.dispose();
+    describeGraphState.layout.kill();
+    describeGraphState.renderer.kill();
+    describeGraphState = null;
+  }
+  container.innerHTML = "";
+  describeGraphState = buildGraphView(container, graphData, { byKind: true });
+  renderGraphLegend(container, graphData);
+}
 
 loadMonumentList();
 initBackgroundSlideshow();
