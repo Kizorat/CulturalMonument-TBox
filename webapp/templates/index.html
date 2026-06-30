@@ -159,36 +159,51 @@
 
   <section id="view-nearby" class="view hidden">
     <div class="card">
-      <h3>Relazioni di vicinanza</h3>
+      <h3>Stessa via o piazza</h3>
       <p class="hint">
-        Una query <code>CONSTRUCT</code> genera nuove triple <code>afi:vicinoA</code> tra i
-        monumenti la cui distanza è inferiore a una soglia. La distanza è calcolata
-        <em>dentro</em> la query (approssimazione equirettangolare sulle coordinate
-        <code>geo:asWKT</code>), non in Python. Scegli la soglia e genera il grafo.
+        Una query <code>CONSTRUCT</code> genera nuove triple
+        <code>afi:stessaUbicazioneDi</code> tra i monumenti che condividono lo stesso
+        <em>toponimo</em> (la via o la piazza), estratto da <code>clv:fullAddress</code>
+        direttamente nella query con <code>STRBEFORE</code>. I monumenti vengono poi
+        raggruppati per luogo: ogni scheda è una via o una piazza, le pillole sono i
+        monumenti che vi si trovano (clicca per aprirne la scheda).
       </p>
 
-      <form id="nearby-form" class="add-form">
-        <div class="form-field">
-          <label for="nb-threshold">Soglia di vicinanza (km)</label>
-          <input type="number" id="nb-threshold" name="threshold"
-                 min="0.05" max="5" step="0.05" value="0.3" required>
-        </div>
-        <div class="form-actions">
-          <button type="submit" class="btn-primary">Genera relazioni di vicinanza</button>
-        </div>
-      </form>
-
-      <p id="nb-summary" class="hint"></p>
-      <div class="describe-columns">
-        <div>
-          <h4>Coppie generate</h4>
-          <ul id="nb-pairs" class="nearby-list"></ul>
-        </div>
-        <div>
-          <h4>Triple RDF prodotte (Turtle)</h4>
-          <pre id="nb-turtle" class="rdf-output"></pre>
-        </div>
+      <div class="form-actions">
+        <button id="sl-run" class="btn-primary">Raggruppa per via o piazza</button>
       </div>
+
+      <p id="sl-summary" class="hint"></p>
+      <div id="sl-groups" class="location-groups"></div>
+
+      <details class="card card-collapsible" id="sl-graph-details">
+        <summary><h3>Grafo delle triple prodotte</h3></summary>
+        <div class="card-body">
+          <p class="hint">
+            Le triple <code>afi:stessaUbicazioneDi</code> generate dalla
+            <code>CONSTRUCT</code>: ogni monumento è un nodo, ogni arco collega due
+            monumenti dello stesso luogo. I nodi sono colorati per via/piazza, così
+            ogni gruppo forma un cluster distinto. Trascina i nodi per riorganizzarli.
+          </p>
+          <div id="sl-graph" class="onto-graph monument-graph"></div>
+        </div>
+      </details>
+
+      <details class="card card-collapsible" id="sl-onto-details">
+        <summary><h3>L'ontologia con il popolamento della nuova relazione</h3></summary>
+        <div class="card-body">
+          <p class="hint">
+            Il grafo dell'ontologia di base (le <strong>classi</strong> e le proprietà)
+            arricchito col <strong>popolamento</strong> della sola relazione
+            <code>afi:stessaUbicazioneDi</code>: i monumenti realmente collegati (le
+            <strong>istanze</strong>, colorate per <strong>zona</strong> secondo la legenda)
+            sono legati alla classe <em>CulturalInstituteOrSite</em> da <code>rdf:type</code>
+            (tratteggiato) e tra loro dagli archi <strong style="color:#c62828">rossi</strong>
+            della nuova relazione. Trascina i nodi per riorganizzarli.
+          </p>
+          <div id="sl-onto-graph" class="onto-graph"></div>
+        </div>
+      </details>
     </div>
   </section>
 
@@ -232,7 +247,10 @@
         grafo</em>. Il vocabolario <strong>schema.org</strong> classifica l'entità
         (<code>schema:Library</code>, <code>schema:Organization</code>…) e la collega alle
         risorse che parlano di esso: pagina Wikipedia, sito ufficiale, immagini, categorie.
-        Cerca un monumento.
+        Il grafo non si ferma all'entità specifica: <strong>astrae i concetti generali</strong>
+        che la inquadrano (es. una biblioteca → il concetto <em>Library</em>) e i concetti
+        ad essi correlati (es. <em>Book</em>), tenuti vicini alla risorsa principale da una
+        condizione di correlazione e da un <code>LIMIT</code>. Cerca un monumento.
       </p>
 
       <section class="picker">
@@ -261,7 +279,8 @@
         <h4>Grafo delle risorse collegate</h4>
         <p class="hint">
           Il monumento (al centro) collegato, tramite la risorsa DBpedia, alle risorse
-          trovate sul web. Trascina i nodi per riorganizzarli.
+          trovate sul web. Trascina i nodi per riorganizzarli, oppure clicca su una
+          risorsa collegata per aprirne la pagina web in una nuova scheda.
         </p>
         <div id="dsc-graph" class="onto-graph monument-graph"></div>
 

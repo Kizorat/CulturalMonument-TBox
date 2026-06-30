@@ -570,8 +570,10 @@ def resolve_class_targets(term):
     return []
 
 
-@app.route("/api/graph")
-def ontology_graph():
+def _ontology_graph_data():
+    """Costruisce la vista nodi/archi dell'ontologia di base (TBox): classi,
+    gerarchia subClassOf e object property (con fusione delle coppie inverse).
+    Nessun individuo: è il grafo dell'ontologia, non il popolamento."""
     # QUERY: ontologia-classi
     classes_query = PREFIXES + """
     SELECT ?cls ?label WHERE {
@@ -658,7 +660,58 @@ def ontology_graph():
     for node_id in used_ids:
         nodes.setdefault(node_id, {"id": node_id, "label": short_id(node_id)})
 
-    return jsonify({"nodes": list(nodes.values()), "edges": edges})
+    return {"nodes": list(nodes.values()), "edges": edges}
+
+
+@app.route("/api/graph")
+def ontology_graph():
+    return jsonify(_ontology_graph_data())
+
+
+@app.route("/api/same-location/ontology")
+def same_location_ontology():
+    """Il grafo dell'ontologia di base (TBox: classi e proprietà) ARRICCHITO con il
+    popolamento della sola relazione afi:stessaUbicazioneDi: si eseguono la
+    CONSTRUCT e si aggiungono al grafo i monumenti realmente collegati (le istanze,
+    in blu), gli archi rossi della nuova relazione tra di essi e il rispettivo
+    rdf:type verso la classe CulturalInstituteOrSite. Così la relazione si vede
+    "in azione" sui dati, tra nodi distinti, invece che come self-loop sulla classe
+    (che sigma non disegna)."""
+    data = _ontology_graph_data()
+    cis = str(CIS.CulturalInstituteOrSite)
+    if cis not in {n["id"] for n in data["nodes"]}:
+        data["nodes"].append({"id": cis, "label": short_id(cis)})
+
+    constructed = graph.query(SAME_LOCATION_CONSTRUCT).graph
+
+    def name_of(term):
+        n = graph.value(term, L0.name)
+        return fix_mojibake(str(n)) if n else short_id(str(term))
+
+    # toponimo per ogni monumento, per colorare le istanze per zona (la legenda
+    # nel frontend mappa colore -> via/piazza, come nel "Grafo delle triple prodotte").
+    toponym_by_uri = {}
+    for row in graph.query(SAME_LOCATION_SELECT):
+        top = fix_mojibake(str(row.fa).split(",")[0].strip())
+        if top:
+            toponym_by_uri[str(row.inst)] = top
+
+    instances = {}
+    rel_edges = []
+    for s, _, o in constructed:
+        for term in (s, o):
+            instances.setdefault(str(term), term)
+        rel_edges.append({"from": str(s), "to": str(o),
+                          "label": "stessa ubicazione", "added": True})
+
+    for uri, term in instances.items():
+        data["nodes"].append({"id": uri, "label": name_of(term), "kind": "Monument",
+                              "group": toponym_by_uri.get(uri, ""), "size": 11})
+        # rdf:type: l'istanza appartiene alla classe (arco tratteggiato).
+        data["edges"].append({"from": uri, "to": cis, "label": "rdf:type", "dashes": True})
+    data["edges"].extend(rel_edges)
+
+    return jsonify(data)
 
 
 # Etichette italiane (rdfs:label) delle 3 condizioni di accesso già presenti
@@ -771,84 +824,96 @@ def set_access_condition(inst_id):
 
 
 # ─────────────────────────────────────────────────────────────────────
-# CONSTRUCT — relazione di vicinanza tra monumenti (afi:vicinoA)
+# CONSTRUCT — stessa via/piazza (afi:stessaUbicazioneDi)
 # ─────────────────────────────────────────────────────────────────────
-# Materializza nel grafo una relazione che nei dati grezzi non esiste:
-# due monumenti sono "vicini" se la distanza tra le loro coordinate è sotto
-# una soglia. È una CONSTRUCT pura (nessun calcolo in Python): le coordinate
-# WKT "POINT (lon lat)" vengono scomposte con STRBEFORE/STRAFTER, convertite
-# in xsd:decimal e la distanza è approssimata col modello equirettangolare —
-# a Firenze (lat ~43.77°) 1° di longitudine ≈ 80.2 km e 1° di latitudine ≈
-# 111.0 km. Si confronta la distanza *al quadrato* con la soglia al quadrato
-# (?maxDist2) così da non servire sqrt, che SPARQL 1.1 puro non offre.
-# FILTER(STR(?a) < STR(?b)) tiene una sola coppia per ogni accoppiamento
-# (la relazione è simmetrica) ed esclude l'accoppiamento di un monumento con
-# se stesso.
-# QUERY: vicinanza-construct
-NEARBY_CONSTRUCT = PREFIXES + """
+# Materializza una relazione assente nei dati grezzi: due monumenti condividono
+# l'ubicazione se hanno lo stesso toponimo (la via o la piazza). Il toponimo è
+# il testo prima della prima virgola in clv:fullAddress (es. "Piazza del Duomo,
+# 50122, Firenze, Italia" -> "piazza del duomo"), estratto in pura SPARQL con
+# STRBEFORE. Il confronto è in minuscolo (LCASE) per non distinguere maiuscole.
+# FILTER(STR(?a) < STR(?b)) tiene una sola coppia per accoppiamento ed esclude
+# l'accoppiamento di un monumento con sé stesso.
+# QUERY: stessa-ubicazione-construct
+SAME_LOCATION_CONSTRUCT = PREFIXES + """
 CONSTRUCT {
-    ?a afi:vicinoA ?b .
+    ?a afi:stessaUbicazioneDi ?b .
 }
 WHERE {
-    ?a a cis:CulturalInstituteOrSite ;
-       afi:haCoordinate ?ga .
-    ?ga geo:asWKT ?wktA .
-    ?b a cis:CulturalInstituteOrSite ;
-       afi:haCoordinate ?gb .
-    ?gb geo:asWKT ?wktB .
+    ?a a cis:CulturalInstituteOrSite ; afi:hasAddress ?addrA .
+    ?addrA clv:fullAddress ?fa .
+    ?b a cis:CulturalInstituteOrSite ; afi:hasAddress ?addrB .
+    ?addrB clv:fullAddress ?fb .
     FILTER(STR(?a) < STR(?b))
+    BIND(LCASE(STRBEFORE(?fa, ",")) AS ?viaA)
+    BIND(LCASE(STRBEFORE(?fb, ",")) AS ?viaB)
+    FILTER(?viaA != "" && ?viaA = ?viaB)
+}
+"""
 
-    BIND(xsd:decimal(STRBEFORE(STRAFTER(STR(?wktA), "("), " ")) AS ?lonA)
-    BIND(xsd:decimal(STRBEFORE(STRAFTER(STRAFTER(STR(?wktA), "("), " "), ")")) AS ?latA)
-    BIND(xsd:decimal(STRBEFORE(STRAFTER(STR(?wktB), "("), " ")) AS ?lonB)
-    BIND(xsd:decimal(STRBEFORE(STRAFTER(STRAFTER(STR(?wktB), "("), " "), ")")) AS ?latB)
-
-    BIND((?lonA - ?lonB) * 80.2 AS ?dx)
-    BIND((?latA - ?latB) * 111.0 AS ?dy)
-    BIND(?dx * ?dx + ?dy * ?dy AS ?dist2)
-    FILTER(?dist2 < ?maxDist2)
+# SELECT di supporto: monumento -> toponimo, per raggrupparli lato server e
+# offrire al frontend la vista a schede (una per via/piazza). La CONSTRUCT sopra
+# resta la fonte delle triple RDF mostrate; questa serve solo all'impaginazione.
+# QUERY: monumenti-per-toponimo
+SAME_LOCATION_SELECT = PREFIXES + """
+SELECT ?inst ?name ?fa WHERE {
+    ?inst a cis:CulturalInstituteOrSite ;
+          l0:name ?name ;
+          afi:hasAddress ?addr .
+    ?addr clv:fullAddress ?fa .
 }
 """
 
 
-@app.route("/api/nearby-construct")
-def nearby_construct():
-    """Esegue la CONSTRUCT di vicinanza e restituisce le triple generate.
-    `threshold` (km, default 0.3) è la distanza massima entro cui due monumenti
-    sono considerati vicini. Si restituiscono sia le coppie (con nome, per la
-    lista cliccabile) sia il grafo risultante serializzato in Turtle, per
-    mostrare il dato RDF effettivamente prodotto.
-    """
-    try:
-        threshold = float(request.args.get("threshold", "0.3"))
-    except ValueError:
-        return jsonify({"error": "Soglia non valida."}), 400
-    if not (0 < threshold <= 5):
-        return jsonify({"error": "La soglia deve essere tra 0 e 5 km."}), 400
+@app.route("/api/same-location-construct")
+def same_location_construct():
+    """Esegue la CONSTRUCT che collega i monumenti con lo stesso toponimo
+    (afi:stessaUbicazioneDi) e restituisce i monumenti raggruppati per via/piazza
+    (solo i luoghi condivisi da almeno due monumenti) per la resa a schede, più una
+    vista a grafo (nodi/archi) delle triple generate per disegnarle con sigma."""
+    constructed = graph.query(SAME_LOCATION_CONSTRUCT).graph
 
-    constructed = graph.query(
-        NEARBY_CONSTRUCT, initBindings={"maxDist2": Literal(threshold * threshold)}
-    ).graph
-    constructed.bind("afi", AFI)
+    groups = {}
+    for row in graph.query(SAME_LOCATION_SELECT):
+        toponym = fix_mojibake(str(row.fa).split(",")[0].strip())
+        if not toponym:
+            continue
+        bucket = groups.setdefault(toponym.lower(),
+                                   {"toponym": toponym, "monuments": []})
+        bucket["monuments"].append({
+            "id": short_id(str(row.inst)),
+            "name": fix_mojibake(str(row.name)),
+        })
 
-    def name_of(uri):
-        name = graph.value(uri, L0.name)
-        return fix_mojibake(str(name)) if name else short_id(str(uri))
+    shared = [g for g in groups.values() if len(g["monuments"]) >= 2]
+    for g in shared:
+        g["monuments"].sort(key=lambda m: m["name"])
+    # luoghi più affollati prima, poi in ordine alfabetico di toponimo.
+    shared.sort(key=lambda g: (-len(g["monuments"]), g["toponym"].lower()))
 
-    pairs = [
-        {
-            "a": {"id": short_id(str(s)), "name": name_of(s)},
-            "b": {"id": short_id(str(o)), "name": name_of(o)},
-        }
-        for s, _, o in constructed
-    ]
-    pairs.sort(key=lambda p: (p["a"]["name"], p["b"]["name"]))
+    # Vista a grafo delle triple generate: i monumenti sono i nodi, ogni tripla
+    # afi:stessaUbicazioneDi è un arco. Ogni nodo porta il proprio toponimo
+    # ("group"), così il frontend può colorare i monumenti dello stesso luogo allo
+    # stesso modo (ogni via/piazza diventa un cluster colorato).
+    info_by_id = {m["id"]: (m["name"], g["toponym"])
+                  for g in shared for m in g["monuments"]}
+
+    nodes = {}
+    edges = []
+    for s, _, o in constructed:
+        for uri in (s, o):
+            sid = short_id(str(uri))
+            if sid not in nodes and sid in info_by_id:
+                name, toponym = info_by_id[sid]
+                nodes[sid] = {"id": sid, "label": name, "group": toponym}
+        sa, ob = short_id(str(s)), short_id(str(o))
+        if sa in nodes and ob in nodes:
+            edges.append({"from": sa, "to": ob, "label": "stessa ubicazione"})
 
     return jsonify({
-        "threshold": threshold,
-        "count": len(pairs),
-        "pairs": pairs,
-        "turtle": constructed.serialize(format="turtle"),
+        "groupCount": len(shared),
+        "monumentCount": sum(len(g["monuments"]) for g in shared),
+        "groups": shared,
+        "graph": {"nodes": list(nodes.values()), "edges": edges},
     })
 
 
@@ -944,6 +1009,13 @@ RELATED_GROUP_KIND = {
     "image": "Image",
     "category": "Category",
 }
+
+# Astrazione concettuale: quanti concetti generali ricavare dai tipi dell'entità
+# e quanti concetti correlati pescare dal concetto generale principale. Tetti
+# bassi (LIMIT) di proposito, così i concetti associati restano vicini alla
+# risorsa di partenza e non divaghino.
+GENERAL_CONCEPT_LIMIT = 3
+RELATED_CONCEPT_LIMIT = 4
 
 
 DBPEDIA_LOOKUP = "https://lookup.dbpedia.org/api/search"
@@ -1096,6 +1168,78 @@ def fetch_dbpedia_describe(resource_uri):
         return None
 
 
+def _dbpedia_select(query):
+    """Esegue una SELECT su DBpedia e ritorna le bindings (lista di dict), [] su errore."""
+    try:
+        resp = _dbpedia_get(query, "application/sparql-results+json")
+        resp.raise_for_status()
+        return resp.json().get("results", {}).get("bindings", [])
+    except (requests.RequestException, ValueError):
+        return []
+
+
+# Concetti troppo generici per essere un'astrazione utile: una biblioteca "è un
+# Agente / una Organizzazione" non aggiunge nulla di tematico, quindi si scartano.
+GENERIC_CONCEPTS = {"Agent", "Organisation", "Organization", "Person",
+                    "Place", "Location", "Thing", "Entity"}
+# Concetti corretti ma ampi: restano come nodi, ma per l'espansione nei concetti
+# correlati si preferisce un concetto più specifico (es. Library prima di Building).
+BROAD_CONCEPTS = {"Building", "Structure", "ArchitecturalStructure", "Work"}
+
+
+def fetch_general_concepts(resource_uri, limit=GENERAL_CONCEPT_LIMIT):
+    """Astrae la risorsa specifica ai suoi concetti GENERALI: per ogni tipo
+    dell'ontologia DBpedia dell'entità (dbo:Library, dbo:Building…) costruisce la
+    risorsa omonima (dbo:Library -> dbr:Library, cioè "la biblioteca in generale"),
+    tenendo solo quelle che esistono davvero come risorsa con etichetta inglese.
+
+    Condizione di non-divagazione: i concetti sono per costruzione i *tipi* della
+    risorsa principale (non possono allontanarsi dal tema), meno una stoplist di
+    concetti troppo generici (Agent, Organisation…). I concetti più specifici sono
+    messi in testa, così l'espansione successiva parte dal più pertinente. LIMIT.
+    """
+    query = (
+        'SELECT DISTINCT ?concept ?label WHERE { '
+        '<%(res)s> rdf:type ?cls . '
+        'FILTER(STRSTARTS(STR(?cls), "http://dbpedia.org/ontology/")) '
+        'BIND(IRI(CONCAT("http://dbpedia.org/resource/", '
+        'STRAFTER(STR(?cls), "http://dbpedia.org/ontology/"))) AS ?concept) '
+        '?concept rdfs:label ?label . '
+        'FILTER(LANG(?label) = "en") '
+        '} LIMIT 10' % {"res": resource_uri}
+    )
+    concepts = []
+    for b in _dbpedia_select(query):
+        uri = b["concept"]["value"]
+        local = uri.rsplit("/", 1)[-1]
+        if local in GENERIC_CONCEPTS:
+            continue
+        concepts.append((uri, b["label"]["value"], local in BROAD_CONCEPTS))
+    # i concetti specifici (is_broad=False) ordinano prima di quelli ampi.
+    concepts.sort(key=lambda c: c[2])
+    return [(uri, label) for uri, label, _ in concepts[:limit]]
+
+
+def fetch_related_concepts(concept_uri, limit=RELATED_CONCEPT_LIMIT):
+    """Dalla risorsa-concetto generale (es. dbr:Library) ricava i concetti che la
+    compongono o le sono fortemente legati (es. dbr:Book). Condizione di
+    correlazione: si tengono solo i collegamenti *reciproci* — A wikilink B **e**
+    B wikilink A — indice di forte vicinanza concettuale, con LIMIT perché restino
+    concetti adiacenti e non una catena che si allontana dalla risorsa principale.
+    """
+    query = (
+        'SELECT DISTINCT ?r ?label WHERE { '
+        '<%(c)s> dbo:wikiPageWikiLink ?r . '
+        '?r dbo:wikiPageWikiLink <%(c)s> . '
+        '?r rdfs:label ?label . '
+        'FILTER(LANG(?label) = "en") '
+        'FILTER(STRSTARTS(STR(?r), "http://dbpedia.org/resource/")) '
+        'FILTER(!CONTAINS(STR(?r), "Category:")) '
+        '} LIMIT %(limit)d' % {"c": concept_uri, "limit": limit}
+    )
+    return [(b["r"]["value"], b["label"]["value"]) for b in _dbpedia_select(query)]
+
+
 def readable_label(uri):
     """Etichetta leggibile per una risorsa esterna: ultimo segmento dell'IRI,
     de-quotato e con gli underscore trasformati in spazi (es.
@@ -1222,6 +1366,35 @@ def monument_describe(inst_id):
             ensure_node(str(o), label, RELATED_GROUP_KIND[group])
             edges.append({"from": resource, "to": str(o), "label": pqname})
             count += 1
+
+    # 5) astrazione concettuale: non ci si ferma all'entità specifica, si risale ai
+    #    concetti GENERALI che la inquadrano (una biblioteca -> il concetto
+    #    "Library") e da quello ai concetti CORRELATI che la compongono
+    #    ("Book"). Reciprocità dei wikilink + LIMIT (vedi le funzioni) tengono i
+    #    concetti vicini alla risorsa principale, senza divagare.
+    related["concept"] = []
+    general = fetch_general_concepts(resource)
+    for concept_uri, concept_label in general:
+        if concept_uri == resource:
+            continue
+        result.add((res_ref, AFI.concettoGenerale, URIRef(concept_uri)))
+        ensure_node(concept_uri, concept_label, "Concept")
+        edges.append({"from": resource, "to": concept_uri, "label": "afi:concettoGenerale"})
+        related["concept"].append({"uri": concept_uri, "label": concept_label,
+                                   "source": urlparse(concept_uri).netloc})
+
+    # Solo il concetto generale più rilevante viene espanso nei suoi correlati,
+    # per non moltiplicare le chiamate remote (e restare aderenti al tema).
+    if general:
+        top_uri = general[0][0]
+        for rel_uri, rel_label in fetch_related_concepts(top_uri):
+            if rel_uri in (resource, top_uri):
+                continue
+            result.add((URIRef(top_uri), AFI.concettoCorrelato, URIRef(rel_uri)))
+            ensure_node(rel_uri, rel_label, "Concept")
+            edges.append({"from": top_uri, "to": rel_uri, "label": "afi:concettoCorrelato"})
+            related["concept"].append({"uri": rel_uri, "label": rel_label,
+                                       "source": urlparse(rel_uri).netloc})
 
     return jsonify({
         "id": inst_id,

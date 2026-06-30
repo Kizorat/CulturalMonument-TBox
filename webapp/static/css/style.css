@@ -342,6 +342,74 @@ main {
 
 .gallery-empty { color: var(--card-text-muted); font-style: italic; }
 
+/* ── Schede "Stessa via o piazza" (CONSTRUCT afi:stessaUbicazioneDi) ──── */
+.location-groups {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 0.8rem;
+  margin: 0.8rem 0;
+}
+
+.location-card {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--card-border);
+  border-left: 4px solid var(--accent);
+  border-radius: 8px;
+  padding: 0.7rem 0.85rem;
+}
+
+.location-head {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-bottom: 0.55rem;
+}
+
+.location-pin { font-size: 1rem; }
+
+.location-name {
+  font-weight: 600;
+  color: var(--card-heading);
+  flex: 1;
+}
+
+.location-count {
+  flex: none;
+  min-width: 1.4rem;
+  height: 1.4rem;
+  padding: 0 0.4rem;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 0.8rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.location-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.location-chip {
+  border: 1px solid var(--card-border);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--card-link);
+  border-radius: 999px;
+  padding: 0.25rem 0.7rem;
+  font-size: 0.85rem;
+  cursor: pointer;
+  transition: background 0.15s, transform 0.1s;
+}
+
+.location-chip:hover {
+  background: var(--accent);
+  color: #fff;
+  transform: translateY(-1px);
+}
+
 /* Statistiche di accessibilità: grafico a barre orizzontali in CSS puro */
 .stats-chart {
   display: flex;
