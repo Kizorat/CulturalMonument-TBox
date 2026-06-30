@@ -335,6 +335,8 @@ const KIND_COLORS = {
   Website: "#2e7d32",
   Image: "#ad1457",
   Category: "#00838f",
+  // concetti astratti (biblioteca -> "Library" -> "Book")
+  Concept: "#c62828",
 };
 
 // Assegna una curvatura agli archi paralleli (stessa coppia di nodi, in una
@@ -366,7 +368,7 @@ function assignCurvatures(graph) {
 
 // Costruisce un grafo sigma in `container` a partire da {nodes, edges}.
 // Ritorna { renderer, layout } per poterli distruggere al re-render.
-function buildGraphView(container, data, { byKind = false } = {}) {
+function buildGraphView(container, data, { byKind = false, nodeUrl = null } = {}) {
   const graph = new graphology.MultiGraph();
   const total = data.nodes.length || 1;
   const radius = 10;
@@ -377,8 +379,9 @@ function buildGraphView(container, data, { byKind = false } = {}) {
       label: node.label,
       x: radius * Math.cos(angle) + (Math.random() - 0.5),
       y: radius * Math.sin(angle) + (Math.random() - 0.5),
-      size: node.kind === "Monument" ? 14 : 10,
-      color: byKind ? (KIND_COLORS[node.kind] || "#777") : "#7a3b1d",
+      size: node.size || (node.kind === "Monument" ? 14 : 10),
+      // un colore esplicito sul nodo vince sempre (es. cluster per via/piazza)
+      color: node.color || (byKind ? (KIND_COLORS[node.kind] || "#777") : "#7a3b1d"),
     });
   });
 
@@ -386,8 +389,9 @@ function buildGraphView(container, data, { byKind = false } = {}) {
     if (!graph.hasNode(edge.from) || !graph.hasNode(edge.to)) continue;
     graph.addEdge(edge.from, edge.to, {
       label: edge.label,
-      size: edge.dashes ? 1.5 : 2.5,
-      color: edge.dashes ? "#c98a3a" : "#b08968",
+      // edge.added = la relazione appena introdotta: più spessa e in rosso.
+      size: edge.added ? 4 : (edge.dashes ? 1.5 : 2.5),
+      color: edge.added ? "#c62828" : (edge.dashes ? "#c98a3a" : "#b08968"),
       // le coppie inverse arrivano già fuse dal backend (bidirectional) -> doppia freccia
       baseType: edge.bidirectional ? "double" : "straight",
     });
@@ -426,7 +430,7 @@ function buildGraphView(container, data, { byKind = false } = {}) {
   const physics = makePhysicsController(layout);
   physics.run(3500);  // settle iniziale poi stop
 
-  enableNodeDragging(renderer, graph, physics);
+  enableNodeDragging(renderer, graph, physics, nodeUrl);
   return { renderer, layout, physics };
 }
 
@@ -456,19 +460,37 @@ function makePhysicsController(layout) {
   };
 }
 
-function enableNodeDragging(renderer, graph, physics) {
+function enableNodeDragging(renderer, graph, physics, nodeUrl = null) {
   let draggedNode = null;
   let isDragging = false;
+  let moved = false;       // true appena il puntatore si sposta: distingue drag da click
+  let downX = 0, downY = 0;
+
+  // Nodi con una pagina web associata (nodeUrl): cursore a manina al passaggio,
+  // così è chiaro che un click li apre in una nuova scheda.
+  if (nodeUrl) {
+    renderer.on("enterNode", ({ node }) => {
+      renderer.getContainer().style.cursor = nodeUrl(node) ? "pointer" : "default";
+    });
+    renderer.on("leaveNode", () => {
+      renderer.getContainer().style.cursor = "default";
+    });
+  }
 
   renderer.on("downNode", (e) => {
     isDragging = true;
     draggedNode = e.node;
+    moved = false;
+    downX = e.event.x;
+    downY = e.event.y;
     graph.setNodeAttribute(draggedNode, "highlighted", true);
     physics.hold();  // physics attiva durante il trascinamento
   });
 
   renderer.on("moveBody", ({ event }) => {
     if (!isDragging || !draggedNode) return;
+    // oltre una piccola soglia è un vero trascinamento, non un click "fermo"
+    if (Math.hypot(event.x - downX, event.y - downY) > 4) moved = true;
     const pos = renderer.viewportToGraph(event);
     graph.setNodeAttribute(draggedNode, "x", pos.x);
     graph.setNodeAttribute(draggedNode, "y", pos.y);
@@ -478,7 +500,14 @@ function enableNodeDragging(renderer, graph, physics) {
   });
 
   const handleUp = () => {
-    if (draggedNode) graph.removeNodeAttribute(draggedNode, "highlighted");
+    if (draggedNode) {
+      graph.removeNodeAttribute(draggedNode, "highlighted");
+      // click "fermo" su un nodo con pagina web: lo apro in una nuova scheda.
+      if (!moved && nodeUrl) {
+        const url = nodeUrl(draggedNode);
+        if (url) window.open(url, "_blank", "noopener");
+      }
+    }
     isDragging = false;
     draggedNode = null;
     physics.run(1500);  // lascia rilassare poi ferma
@@ -529,6 +558,7 @@ function renderGraphLegend(container, data) {
     AccessCondition: "Accessibilità", WebSite: "Sito web", Email: "Email", Telephone: "Telefono",
     DBpedia: "Risorsa DBpedia", SchemaType: "Tipo schema.org",
     Wikipedia: "Wikipedia", Website: "Sito ufficiale", Image: "Immagine", Category: "Categoria",
+    Concept: "Concetto correlato",
   };
   for (const kind of kinds) {
     const item = document.createElement("span");
@@ -652,6 +682,20 @@ function showView(name) {
     monumentGraphState?.physics.stop();
   }
 
+  if (name === "nearby" && slGraphState && slGraphDetails.open) {
+    slGraphState.renderer.refresh();
+    slGraphState.physics.run(2000);
+  } else {
+    slGraphState?.physics.stop();
+  }
+
+  if (name === "nearby" && slOntoState && slOntoDetails.open) {
+    slOntoState.renderer.refresh();
+    slOntoState.physics.run(2000);
+  } else {
+    slOntoState?.physics.stop();
+  }
+
 }
 
 tabButtons.forEach((btn) => btn.addEventListener("click", () => showView(btn.dataset.view)));
@@ -748,62 +792,189 @@ editAccessForm.addEventListener("submit", async (e) => {
   }
 });
 
-// ── Sezione "Vicinanze" (query SPARQL CONSTRUCT) ────────────────────
-// Esegue la CONSTRUCT lato backend con la soglia scelta e mostra sia le coppie
-// di monumenti vicini (cliccabili) sia le triple afi:vicinoA generate in Turtle.
-const nearbyForm = document.getElementById("nearby-form");
-const nbThreshold = document.getElementById("nb-threshold");
-const nbSummary = document.getElementById("nb-summary");
-const nbPairs = document.getElementById("nb-pairs");
-const nbTurtle = document.getElementById("nb-turtle");
-
+// Apre la scheda di un monumento riusando la search bar principale. Usata dalle
+// pillole della sezione "Stessa via o piazza".
 function openMonument(monumentId) {
-  // riusa la search bar principale per aprire la scheda del monumento
   monumentSearch.selectById(monumentId);
   showView("monuments");
   panel.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
-nearbyForm.addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const submitBtn = nearbyForm.querySelector(".btn-primary");
-  submitBtn.disabled = true;
-  nbSummary.textContent = "Esecuzione della query CONSTRUCT…";
-  nbPairs.innerHTML = "";
-  nbTurtle.textContent = "";
+// ── Sezione "Stessa via o piazza" (CONSTRUCT afi:stessaUbicazioneDi) ──
+// Esegue la CONSTRUCT lato backend e impagina il risultato come schede: una per
+// via/piazza, con i monumenti come pillole cliccabili (riusa openMonument).
+const slRun = document.getElementById("sl-run");
+const slSummary = document.getElementById("sl-summary");
+const slGroups = document.getElementById("sl-groups");
+const slGraphDetails = document.getElementById("sl-graph-details");
+
+// Palette per colorare i cluster (un colore per via/piazza). Si ripete in modo
+// ciclico se i gruppi superano i colori disponibili.
+const LOCATION_PALETTE = [
+  // 1° colore = zona più affollata (qui Piazza della Signoria): magenta, anche
+  // per non confondersi col marrone delle classi nel grafo dell'ontologia.
+  "#b5179e", "#2e7d32", "#1565c0", "#c98a3a", "#6a1b9a",
+  "#ad1457", "#00838f", "#37474f", "#5d4037", "#283593",
+];
+
+let slGraphState = null;
+let slLastData = null;
+
+function renderSameLocationGraph() {
+  if (!slLastData) return;
+  const container = document.getElementById("sl-graph");
+  if (slGraphState) {
+    slGraphState.physics.dispose();
+    slGraphState.layout.kill();
+    slGraphState.renderer.kill();
+    slGraphState = null;
+  }
+  container.innerHTML = "";
+
+  // un colore per toponimo, nell'ordine dei gruppi (i più affollati per primi).
+  const colorByToponym = new Map();
+  slLastData.groups.forEach((g, i) => {
+    colorByToponym.set(g.toponym, LOCATION_PALETTE[i % LOCATION_PALETTE.length]);
+  });
+
+  const nodes = slLastData.graph.nodes.map((n) => ({
+    ...n, kind: "Monument", color: colorByToponym.get(n.group) || "#777",
+  }));
+  slGraphState = buildGraphView(container, { nodes, edges: slLastData.graph.edges },
+                                { byKind: true });
+
+  // legenda: pallino colorato + nome del luogo, riusa lo stile .graph-legend.
+  const existing = container.parentElement.querySelector(".graph-legend");
+  if (existing) existing.remove();
+  const legend = document.createElement("div");
+  legend.className = "graph-legend";
+  for (const [toponym, color] of colorByToponym) {
+    const item = document.createElement("span");
+    item.className = "legend-item";
+    item.innerHTML = `<span class="legend-dot" style="background:${color}"></span>${escapeHtml(toponym)}`;
+    legend.appendChild(item);
+  }
+  container.parentElement.appendChild(legend);
+}
+
+// il grafo (canvas WebGL) si disegna solo quando la card è aperta, e si rifà se i
+// dati cambiano; quando si chiude, si ferma la physics per non sprecare CPU.
+slGraphDetails.addEventListener("toggle", () => {
+  if (slGraphDetails.open) renderSameLocationGraph();
+  else slGraphState?.physics.stop();
+});
+
+// Ontologia di base + popolamento di afi:stessaUbicazioneDi (istanze colorate
+// per zona, come nel "Grafo delle triple prodotte", con la stessa legenda).
+const slOntoDetails = document.getElementById("sl-onto-details");
+let slOntoState = null;
+
+async function renderSameLocationOntology() {
+  const container = document.getElementById("sl-onto-graph");
+  const res = await fetch("/api/same-location/ontology");
+  const data = await res.json();
+  if (slOntoState) {
+    slOntoState.physics.dispose();
+    slOntoState.layout.kill();
+    slOntoState.renderer.kill();
+  }
+  container.innerHTML = "";
+
+  // un colore per zona (toponimo): conta le istanze per gruppo e ordina come
+  // l'altra card (più affollate prima), così i colori coincidono tra le due viste.
+  const counts = new Map();
+  for (const n of data.nodes) {
+    if (n.group) counts.set(n.group, (counts.get(n.group) || 0) + 1);
+  }
+  const zones = [...counts.keys()].sort(
+    (a, b) => counts.get(b) - counts.get(a) || a.toLowerCase().localeCompare(b.toLowerCase()));
+  const colorByZone = new Map();
+  zones.forEach((z, i) => colorByZone.set(z, LOCATION_PALETTE[i % LOCATION_PALETTE.length]));
+
+  // le sole istanze (nodi con group) prendono il colore della loro zona; le
+  // classi dell'ontologia restano col colore di default.
+  const nodes = data.nodes.map((n) =>
+    n.group ? { ...n, color: colorByZone.get(n.group) } : n);
+  slOntoState = buildGraphView(container, { nodes, edges: data.edges }, { byKind: false });
+
+  // legenda zona -> colore, riusa lo stile .graph-legend dell'altra card.
+  const existing = container.parentElement.querySelector(".graph-legend");
+  if (existing) existing.remove();
+  const legend = document.createElement("div");
+  legend.className = "graph-legend";
+  for (const [zone, color] of colorByZone) {
+    const item = document.createElement("span");
+    item.className = "legend-item";
+    item.innerHTML = `<span class="legend-dot" style="background:${color}"></span>${escapeHtml(zone)}`;
+    legend.appendChild(item);
+  }
+  container.parentElement.appendChild(legend);
+}
+
+slOntoDetails.addEventListener("toggle", () => {
+  if (!slOntoDetails.open) { slOntoState?.physics.stop(); return; }
+  if (slOntoState) {
+    slOntoState.renderer.refresh();
+    slOntoState.physics.run(2000);
+  } else {
+    renderSameLocationOntology();
+  }
+});
+
+slRun.addEventListener("click", async () => {
+  slRun.disabled = true;
+  slSummary.textContent = "Esecuzione della query CONSTRUCT…";
+  slGroups.innerHTML = "";
 
   try {
-    const res = await fetch(`/api/nearby-construct?threshold=${encodeURIComponent(nbThreshold.value)}`);
+    const res = await fetch("/api/same-location-construct");
     const data = await res.json();
     if (!res.ok) {
-      nbSummary.textContent = data.error || "Errore nell'esecuzione della query.";
+      slSummary.textContent = data.error || "Errore nell'esecuzione della query.";
+      return;
+    }
+    slLastData = data;
+
+    slSummary.textContent =
+      `${data.monumentCount} monumenti in ${data.groupCount} tra vie e piazze condivise.`;
+
+    if (data.groups.length === 0) {
+      slGroups.innerHTML = '<p class="contact-empty">Nessuna via o piazza condivisa.</p>';
       return;
     }
 
-    nbSummary.textContent = `${data.count} coppie di monumenti entro ${data.threshold} km.`;
-    nbTurtle.textContent = data.turtle.trim() || "# nessuna tripla generata";
+    for (const group of data.groups) {
+      const card = document.createElement("div");
+      card.className = "location-card";
 
-    if (data.pairs.length === 0) {
-      nbPairs.innerHTML = '<li class="contact-empty">Nessuna coppia entro questa soglia.</li>';
-      return;
+      const head = document.createElement("div");
+      head.className = "location-head";
+      head.innerHTML =
+        '<span class="location-pin" aria-hidden="true">📍</span>' +
+        `<span class="location-name">${escapeHtml(group.toponym)}</span>` +
+        `<span class="location-count">${group.monuments.length}</span>`;
+
+      const chips = document.createElement("div");
+      chips.className = "location-chips";
+      for (const m of group.monuments) {
+        const chip = document.createElement("button");
+        chip.type = "button";
+        chip.className = "location-chip";
+        chip.textContent = m.name;
+        chip.addEventListener("click", () => openMonument(m.id));
+        chips.appendChild(chip);
+      }
+
+      card.append(head, chips);
+      slGroups.appendChild(card);
     }
-    for (const pair of data.pairs) {
-      const li = document.createElement("li");
-      const a = document.createElement("a");
-      a.href = "#"; a.className = "nearby-link"; a.textContent = pair.a.name;
-      a.addEventListener("click", (ev) => { ev.preventDefault(); openMonument(pair.a.id); });
-      const b = document.createElement("a");
-      b.href = "#"; b.className = "nearby-link"; b.textContent = pair.b.name;
-      b.addEventListener("click", (ev) => { ev.preventDefault(); openMonument(pair.b.id); });
-      const sep = document.createElement("span");
-      sep.className = "nearby-distance"; sep.textContent = "↔";
-      li.append(a, sep, b);
-      nbPairs.appendChild(li);
-    }
+
+    // se la card del grafo è già aperta, ridisegnalo con i nuovi dati.
+    if (slGraphDetails.open) renderSameLocationGraph();
   } catch {
-    nbSummary.textContent = "Impossibile contattare il server. Riprova.";
+    slSummary.textContent = "Impossibile contattare il server. Riprova.";
   } finally {
-    submitBtn.disabled = false;
+    slRun.disabled = false;
   }
 });
 
@@ -925,7 +1096,17 @@ function renderDescribeGraph(graphData) {
     describeGraphState = null;
   }
   container.innerHTML = "";
-  describeGraphState = buildGraphView(container, graphData, { byKind: true });
+  // Le risorse collegate (DBpedia, Wikipedia, sito, immagini, categorie) hanno
+  // come id il loro IRI reale: rendile cliccabili per aprirne la pagina web. Il
+  // nodo centrale (il monumento) è la risorsa "principale", non un link esterno.
+  const byId = new Map(graphData.nodes.map((n) => [n.id, n]));
+  describeGraphState = buildGraphView(container, graphData, {
+    byKind: true,
+    nodeUrl: (id) => {
+      const node = byId.get(id);
+      return node && node.kind !== "Monument" && /^https?:\/\//.test(id) ? id : null;
+    },
+  });
   renderGraphLegend(container, graphData);
 }
 
