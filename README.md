@@ -373,12 +373,14 @@ applicate all'ontologia prodotta dalla pipeline:
 
 | Forma | Dove | A cosa serve |
 |-------|------|--------------|
-| `SELECT` | elenco monumenti, dettaglio, contatti (`haContatti+`), vicini | Recupero ed esplorazione dei dati. |
-| `SELECT` + `GROUP BY`/`COUNT` | Statistiche | Aggregazione per condizione di accessibilità (con `OPTIONAL`/`COALESCE`). |
-| `ASK` | Completezza | Risposta booleana sull'esistenza di monumenti privi di una proprietà. |
-| `CONSTRUCT` | Modifica Accessibilità, Vicinanze | Genera triple nuove: la condizione di accesso mancante e `afi:stessaUbicazioneDi`. |
-| `DESCRIBE` (remota) | Ulteriori informazioni | Arricchimento Linked Data da DBpedia. |
-| `FILTER NOT EXISTS` | Statistiche, Completezza, Modifica Accessibilità | Interroga *esplicitamente* l'assenza di una tripla (Open World Assumption). |
+| `SELECT` | Seleziona Monumento (elenco, dettaglio, contatti con `haContatti+`, foto, monumenti vicini) | Recupero ed esplorazione dei dati. |
+| `SELECT` | Grafico dell'Ontologia (classi, `rdfs:subClassOf`, object property con dominio/range) | Ricostruzione della vista T-Box: classi e relazioni. |
+| `SELECT` + `GROUP BY`/`COUNT` | Statistiche | Aggregazione per condizione di accessibilità, con `OPTIONAL` + `COALESCE` per la voce *"Nessuna informazione"*. |
+| `ASK` | Completezza | Risposta booleana: «esiste un monumento *privo* della proprietà scelta?». |
+| `ASK` (remota) | Ulteriori informazioni | Verifica che la risorsa DBpedia sia davvero fiorentina (scarta gli omonimi). |
+| `CONSTRUCT` | Modifica Accessibilità, Vicinanze | Genera triple nuove: la condizione di accesso mancante (`ac:hasAccessCondition`) e `afi:stessaUbicazioneDi`. |
+| `DESCRIBE` (remota) | Ulteriori informazioni | Arricchimento Linked Data da DBpedia (con `SELECT` remote per concetti generali/correlati). |
+| `FILTER NOT EXISTS` | Completezza, Modifica Accessibilità | Interroga *esplicitamente* l'assenza di una tripla (Open World Assumption). |
 
 Ovunque i parametri arrivano come termini RDF già tipizzati via `initBindings`
 (niente interpolazione di stringhe → niente SPARQL injection).
